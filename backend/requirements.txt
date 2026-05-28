@@ -1,0 +1,19 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+celery==5.4.0
+redis==5.1.1
+librosa==0.10.2
+numpy==1.26.4
+scipy==1.14.1
+pedalboard==0.9.14
+pyloudnorm==0.1.1
+soundfile==0.12.1
+pyrubberband==0.3.0
+pydub==0.25.1
+ffmpeg-python==0.2.0
+# Optional: install separately due to size
+# crepe==0.0.13           # pip install crepe
+# torch==2.4.1
+# torchaudio==2.4.1
+# deepfilternet==0.5.6    # pip install deepfilternet

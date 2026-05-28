@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+      - ./frontend:/app/../frontend
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - UPLOADS_DIR=/app/uploads
+      - OUTPUTS_DIR=/app/outputs
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: celery -A worker worker --loglevel=info --concurrency=2
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - UPLOADS_DIR=/app/uploads
+      - OUTPUTS_DIR=/app/outputs
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
