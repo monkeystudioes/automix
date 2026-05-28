@@ -73,6 +73,11 @@ def _to_wav_48k(src_path: str) -> str:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+@app.get('/health')
+async def health():
+    return {'status': 'ok'}
+
+
 @app.post('/api/session')
 async def create_session():
     sid = _session_id()
