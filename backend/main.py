@@ -9,17 +9,12 @@ import time
 import uuid
 from pathlib import Path
 
-import librosa
-import numpy as np
-import soundfile as sf
+from celery import Celery
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
-from pipeline.analysis import analyze_file
-from worker import celery_app, process_task
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(name)s %(levelname)s — %(message)s')
@@ -27,10 +22,20 @@ logger = logging.getLogger(__name__)
 
 UPLOADS_DIR = os.environ.get('UPLOADS_DIR', '/app/uploads')
 OUTPUTS_DIR = os.environ.get('OUTPUTS_DIR', '/app/outputs')
+REDIS_URL   = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 TARGET_SR   = 48000
 MAX_FILE_MB = 200
 
 app = FastAPI(title='AutoMix API', version='3.2.0')
+
+# Lightweight Celery client — does NOT import any pipeline code
+celery_app = Celery('automix', broker=REDIS_URL, backend=REDIS_URL)
+celery_app.conf.update(
+    task_serializer='json',
+    result_serializer='json',
+    accept_content=['json'],
+    result_expires=86400,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +44,6 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-# In-memory session store (use Redis in production for multi-instance)
 sessions: dict[str, dict] = {}
 
 
@@ -50,25 +54,12 @@ def _session_id() -> str:
 
 
 def _save_upload(upload: UploadFile, dest_dir: str, file_id: str) -> str:
-    """Save uploaded file, returning the path."""
     os.makedirs(dest_dir, exist_ok=True)
     ext = Path(upload.filename).suffix.lower() or '.wav'
     path = os.path.join(dest_dir, f"{file_id}{ext}")
     with open(path, 'wb') as f:
         f.write(upload.file.read())
     return path
-
-
-def _to_wav_48k(src_path: str) -> str:
-    """Convert any audio to WAV 48kHz 24-bit, return new path."""
-    dest = src_path.rsplit('.', 1)[0] + '_48k.wav'
-    if os.path.exists(dest):
-        return dest
-    y, sr = librosa.load(src_path, sr=None, mono=True)
-    if sr != TARGET_SR:
-        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
-    sf.write(dest, y, TARGET_SR, subtype='PCM_24')
-    return dest
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -94,23 +85,30 @@ async def upload_file(session_id: str, kind: str, file: UploadFile = File(...)):
     if kind not in ('instrumental', 'vocal'):
         raise HTTPException(400, 'kind must be instrumental or vocal')
 
-    # Size check
     content = await file.read()
     size_mb = len(content) / 1e6
     if size_mb > MAX_FILE_MB:
         raise HTTPException(413, f'File too large ({size_mb:.1f} MB, max {MAX_FILE_MB} MB)')
-
-    # Reset to start of stream
     file.file.seek(0)
 
-    file_id = f"{session_id}_{kind}_{uuid.uuid4().hex[:8]}"
+    file_id  = f"{session_id}_{kind}_{uuid.uuid4().hex[:8]}"
     dest_dir = os.path.join(UPLOADS_DIR, session_id)
     raw_path = _save_upload(file, dest_dir, file_id)
 
-    # Convert to 48kHz WAV for processing
-    wav_path = _to_wav_48k(raw_path)
+    # Lazy import — only loads librosa/scipy when first file is uploaded
+    import librosa
+    import soundfile as sf
+    from pipeline.analysis import analyze_file
 
-    # Analyze
+    # Convert to 48kHz WAV
+    dest = raw_path.rsplit('.', 1)[0] + '_48k.wav'
+    if not os.path.exists(dest):
+        y, sr = librosa.load(raw_path, sr=None, mono=True)
+        if sr != TARGET_SR:
+            y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
+        sf.write(dest, y, TARGET_SR, subtype='PCM_24')
+    wav_path = dest
+
     analysis = analyze_file(wav_path)
 
     sessions[session_id]['files'][kind] = {
@@ -121,16 +119,13 @@ async def upload_file(session_id: str, kind: str, file: UploadFile = File(...)):
     }
 
     response = {
-        'file_id':    file_id,
-        'duration':   round(analysis['duration'], 2),
+        'file_id':     file_id,
+        'duration':    round(analysis['duration'], 2),
         'sample_rate': TARGET_SR,
-        'snr_db':     round(analysis['snr_db'], 1),
+        'snr_db':      round(analysis['snr_db'], 1),
     }
     if kind == 'instrumental':
-        response.update({
-            'bpm': analysis['bpm'],
-            'key': analysis['key'],
-        })
+        response.update({'bpm': analysis['bpm'], 'key': analysis['key']})
     else:
         response.update({
             'detected_noise_level': analysis['snr_db'],
@@ -169,7 +164,8 @@ async def start_process(session_id: str, params: ProcessParams):
         **params.model_dump(),
     }
 
-    task = process_task.apply_async(args=[job_params])
+    # Dispatch task by name — no pipeline imports needed here
+    task = celery_app.send_task('automix.process', args=[job_params])
     sessions[session_id]['job_id'] = task.id
 
     logger.info(f"[{session_id}] Process started — job_id={task.id}")
@@ -224,30 +220,23 @@ async def get_result(session_id: str):
 
 @app.get('/api/files/{filename}')
 async def serve_file(filename: str):
-    """Serve output files (WAV, MP3, JSON)."""
-    # Security: strip path traversal
     filename = Path(filename).name
     session_id = filename.split('_')[0] + '-' + filename.split('_')[1] if '-' in filename else filename.rsplit('_', 2)[0]
-
-    # Try session-specific folder first
     path = os.path.join(OUTPUTS_DIR, session_id, filename)
     if not os.path.exists(path):
-        # Flat fallback
         path = os.path.join(OUTPUTS_DIR, filename)
-
     if not os.path.exists(path):
         raise HTTPException(404, f'File not found: {filename}')
-
     return FileResponse(path)
 
 
-# Serve frontend static files (in production / Docker build)
+# Serve frontend
 frontend_dir = os.path.join(os.path.dirname(__file__), '..', 'frontend')
 if os.path.isdir(frontend_dir):
     app.mount('/static', StaticFiles(directory=frontend_dir), name='static')
 
-    @app.get('/')
-    async def serve_index():
+    @app.get('/{full_path:path}')
+    async def serve_frontend(full_path: str):
         index = os.path.join(frontend_dir, 'index.html')
         if os.path.exists(index):
             return FileResponse(index)
